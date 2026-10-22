@@ -1,0 +1,19 @@
+# build output (releases carry the .nro and the .exe)
+build/
+dist/
+*.elf
+*.nro
+*.nacp
+*.map
+*.exe
+pc/obj/
+
+# kept locally, not part of the project
+archive/
+debug-archive/
+crash_reports/
+tools/switch-sync/
+test/gopeer/go.sum
+
+# this machine's toolchain paths
+toolchain.local.ps1

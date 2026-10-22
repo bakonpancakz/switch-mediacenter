@@ -1,0 +1,11 @@
+# keep LF everywhere (the build sources a bash script; CRLF breaks it)
+* text=auto eol=lf
+*.jpg binary
+*.png binary
+*.ttf binary
+*.tif binary
+*.mp4 binary
+*.wav binary
+*.epub binary
+*.cbz binary
+*.pdf binary
