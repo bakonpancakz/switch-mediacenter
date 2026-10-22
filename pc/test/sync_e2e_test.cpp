@@ -274,6 +274,45 @@ TEST(missing_folder_stops_before_deleting) {
     CHECK(fsx::size(g_card + "/.media/files/Pictures/big.png") > 0);
 }
 
+// A file too big for FAT32 goes over as the Switch's split file: a folder with
+// the archive attribute holding parts 00, 01... (forced here with small parts,
+// as the test card isn't FAT32). Later syncs and a lost library see it as the
+// one file it is.
+TEST(big_files_are_split_for_fat32) {
+    splitForTests(100000, 40000);
+    copyFx("tone.wav", g_pc + "/Pictures/Long/tone.wav");  // 176478 bytes: parts of 40000, 40000, 40000, 40000, 16478
+    SyncResult r = syncOnce(makeConfig());
+    CHECK(r.ok);
+    CHECK(r.copied >= 1);
+    std::string split = g_card + "/.media/files/Pictures/Long/tone.wav";
+    DWORD attr = GetFileAttributesW(wide(split).c_str());
+    CHECK(attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) && (attr & FILE_ATTRIBUTE_ARCHIVE));
+    CHECK_EQ(fsx::size(split + "/00"), 40000ll);
+    CHECK_EQ(fsx::size(split + "/03"), 40000ll);
+    CHECK_EQ(fsx::size(split + "/04"), 16478ll);
+    CHECK(fsx::size(split + "/05") < 0);
+    CHECK_EQ(fsx::splitFileSize(split), 176478ll);
+    std::vector<uint8_t> orig, joined, part;
+    readWhole("test/fixtures/tone.wav", orig);
+    for (const char* n : {"/00", "/01", "/02", "/03", "/04"}) {
+        readWhole(split + n, part);
+        joined.insert(joined.end(), part.begin(), part.end());
+    }
+    CHECK(joined == orig);
+    {
+        Db lib(g_card + "/system.db");
+        CHECK_EQ(lib.num("SELECT size FROM items WHERE path = '.media/files/Pictures/Long/tone.wav'"), 176478ll);
+    }
+
+    CHECK(syncOnce(makeConfig()).nothingChanged);  // the next sync leaves it be
+    fsx::removeAll(g_card + "/system.db");          // and a rebuilt library counts it as there
+    SyncResult again = syncOnce(makeConfig());
+    CHECK(again.ok);
+    CHECK_EQ(again.copied, 0);
+    CHECK_EQ(fsx::splitFileSize(split), 176478ll);
+    splitForTests(0, 0);
+}
+
 int main() {
     wchar_t tmp[MAX_PATH];
     GetTempPathW(MAX_PATH, tmp);

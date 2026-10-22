@@ -40,5 +40,15 @@ struct SyncResult {
     uint64_t bytes = 0;
 };
 
+// FAT32 can't hold a file of 4 GB or more: on such a card, those are written as
+// the Switch's split files (fsx::splitFileSize), parts of 0xFFFF0000 bytes (the
+// size the console's file system reads them in).
+constexpr uint64_t kSplitPart = 0xFFFF0000ull;
+// Writes src as a split file at dstDir.
+bool copySplitFile(const std::string& src, const std::string& dstDir, uint64_t partSize, const std::atomic<bool>& cancel,
+                   const std::function<void(uint64_t)>& progress, unsigned long& error);
+// Tests: split files bigger than `over` into parts of `part` bytes on any drive (0 = only on FAT32, as above).
+void splitForTests(uint64_t over, uint64_t part);
+
 SyncResult syncToCard(Sql& work, const Model& model, const std::string& cardRoot, const std::string& pcName,
                       const std::atomic<bool>& cancel, const std::function<void(const SyncProgress&)>& progress);

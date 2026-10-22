@@ -119,6 +119,10 @@ midway loses at most the last couple of seconds; the next sync carries on.
 File names on the card are plain ASCII: the Switch can't open names with other characters on a FAT32 card, so the
 PC gives those an ASCII name plus a short hash. The app still shows the real name.
 
+FAT32 can't hold a file of 4 GB or more, so on a FAT32 card those go over as the Switch's own split files: a folder
+with the archive attribute holding parts `00`, `01`, … The console's file system reads that as one file, so a long
+movie plays and seeks like any other.
+
 ```
 sdmc:/switch/mediacenter/
 ├── MediaCenter.nro

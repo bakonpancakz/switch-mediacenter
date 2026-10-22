@@ -118,6 +118,8 @@ std::string modelDigest(const Model& m) {
     return hashHex(s.data(), s.size());
 }
 
+uint64_t s_testSplitOver = 0, s_testSplitPart = 0;
+
 struct CopyCtx {
     const std::atomic<bool>* cancel;
     std::function<void(uint64_t)> progress;
@@ -236,6 +238,64 @@ bool writeLibrary(Sql& card, Sql& work, const Model& model, const std::set<std::
 
 }  // namespace
 
+void splitForTests(uint64_t over, uint64_t part) {
+    s_testSplitOver = over;
+    s_testSplitPart = part;
+}
+
+bool copySplitFile(const std::string& src, const std::string& dstDir, uint64_t partSize, const std::atomic<bool>& cancel,
+                   const std::function<void(uint64_t)>& progress, unsigned long& error) {
+    error = 0;
+    HANDLE in = CreateFileW(winPath(src).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (in == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        return false;
+    }
+    bool ok = CreateDirectoryW(winPath(dstDir).c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+    // the archive attribute is what makes the folder a file to the Switch
+    if (ok) ok = SetFileAttributesW(winPath(dstDir).c_str(), FILE_ATTRIBUTE_ARCHIVE) != 0;
+    if (!ok) error = GetLastError();
+    LARGE_INTEGER total = {};
+    if (ok && !GetFileSizeEx(in, &total)) {
+        error = GetLastError();
+        ok = false;
+    }
+    std::vector<uint8_t> buf(4 << 20);
+    uint64_t done = 0, size = (uint64_t)total.QuadPart;
+    int parts = (int)std::max<uint64_t>(1, (size + partSize - 1) / partSize);
+    for (int part = 0; ok && part < parts; part++) {
+        char name[8];
+        snprintf(name, sizeof(name), "/%02d", part);
+        HANDLE out = CreateFileW(winPath(dstDir + name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (out == INVALID_HANDLE_VALUE) {
+            error = GetLastError();
+            ok = false;
+            break;
+        }
+        uint64_t left = std::min(partSize, size - done);  // every part full, but the last
+        while (ok && left > 0) {
+            DWORD got = 0, wrote = 0;
+            if (cancel) {
+                error = ERROR_REQUEST_ABORTED;
+                ok = false;
+            } else if (!ReadFile(in, buf.data(), (DWORD)std::min<uint64_t>(buf.size(), left), &got, nullptr) || got == 0) {
+                error = got == 0 ? ERROR_HANDLE_EOF : GetLastError();  // (shorter than it said: changed while copying)
+                ok = false;
+            } else if (!WriteFile(out, buf.data(), got, &wrote, nullptr) || wrote != got) {
+                error = GetLastError();
+                ok = false;
+            } else {
+                left -= got;
+                done += got;
+                if (progress) progress(done);
+            }
+        }
+        CloseHandle(out);
+    }
+    CloseHandle(in);
+    return ok;
+}
+
 // ---------------------------------------------------------------- a sync
 
 SyncResult syncToCard(Sql& work, const Model& model, const std::string& root, const std::string& pcName, const std::atomic<bool>& cancel,
@@ -271,7 +331,7 @@ SyncResult syncToCard(Sql& work, const Model& model, const std::string& root, co
         Stmt ins = card.prepare("INSERT OR REPLACE INTO synced(path, size, mtime) VALUES(?, ?, ?)");
         int kept = 0, cleared = 0;
         for (auto& r : model.roots) {
-            fsx::walk(root + "/" + r.dir, [&](const std::string& rel, uint64_t size, bool dir) {
+            fsx::walk(root + "/" + r.dir, [&](const std::string& rel, uint64_t size, bool dir) {  // (split files count as files)
                 if (dir) return;
                 std::string path = r.dir + "/" + rel;
                 auto t = target.find(lower(path));
@@ -279,7 +339,7 @@ SyncResult syncToCard(Sql& work, const Model& model, const std::string& root, co
                     ins.bind(1, path).bind(2, (int64_t)size).bind(3, t->second->mtime).run();
                     kept++;
                 } else if (fsx::removeAll(root + "/" + path)) cleared++;
-            });
+            }, true);
         }
         tx.commit();
         logLine("card: " + std::to_string(kept) + " files already there, " + std::to_string(cleared) + " cleared");
@@ -319,6 +379,20 @@ SyncResult syncToCard(Sql& work, const Model& model, const std::string& root, co
         res.ok = true;
         res.nothingChanged = true;
         return res;
+    }
+
+    // FAT32 holds files up to 4 GB - 1 byte: bigger ones go over as split files
+    uint64_t splitOver = UINT64_MAX, splitPart = kSplitPart;
+    {
+        wchar_t fsName[32] = L"";
+        std::wstring drive = winPath(root).substr(0, 3);
+        if (drive.size() == 3 && drive[1] == L':' && GetVolumeInformationW(drive.c_str(), nullptr, 0, nullptr, nullptr, nullptr, fsName, 32) &&
+            (!wcscmp(fsName, L"FAT32") || !wcscmp(fsName, L"FAT")))
+            splitOver = 0xFFFFFFFFull;
+        if (s_testSplitOver) {
+            splitOver = s_testSplitOver;
+            splitPart = s_testSplitPart;
+        }
     }
 
     // space: if it's tight, the deletes come first (the library briefly lists what's gone)
@@ -385,13 +459,21 @@ SyncResult syncToCard(Sql& work, const Model& model, const std::string& root, co
                             pr.bytesDone = base + done;
                             if (progress && monoMs() - lastReport > 150) { lastReport = monoMs(); progress(pr); }
                         }};
-            ok = CopyFileExW(winPath(f->local).c_str(), winPath(tmp).c_str(), copyProgress, &ctx, nullptr, 0) != 0;
-            if (!ok) code = GetLastError();
+            if (f->size > splitOver) {
+                unsigned long err = 0;
+                ok = copySplitFile(f->local, tmp, splitPart, cancel, ctx.progress, err);
+                code = err;
+                if (ok) logLine("split for FAT32: " + f->remote);
+            } else {
+                ok = CopyFileExW(winPath(f->local).c_str(), winPath(tmp).c_str(), copyProgress, &ctx, nullptr, 0) != 0;
+                if (!ok) code = GetLastError();
+            }
             pr.bytesDone = base;
         }
         if (ok) {
             std::string dest = root + "/" + f->remote;
             fsx::mkdirs(parentOf(dest));
+            if (fsx::isDir(dest)) fsx::removeAll(dest);  // a split file being replaced (folders aren't, by a move)
             ok = MoveFileExW(winPath(tmp).c_str(), winPath(dest).c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
             if (!ok) code = GetLastError();
         }

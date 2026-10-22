@@ -15,7 +15,14 @@ bool removeAll(const std::string& path);        // a file, or a folder and every
 bool removeEmptyDir(const std::string& path);   // false when it has something in it
 bool rename(const std::string& from, const std::string& to);  // replaces `to`
 // Every entry under root (not root itself), parents before children.
-// rel is '/'-separated and relative to root.
-void walk(const std::string& root, const std::function<void(const std::string& rel, uint64_t size, bool dir)>& fn);
+// rel is '/'-separated and relative to root. With splitFiles (walking the
+// Switch's card), a split file (see isSplitFile) is one file of its parts' size.
+void walk(const std::string& root, const std::function<void(const std::string& rel, uint64_t size, bool dir)>& fn,
+          bool splitFiles = false);
+
+// The Switch's way of keeping a file of 4 GB or more on a FAT32 card: a folder
+// with the archive attribute holding the parts "00", "01", ... The console reads
+// it as one file. -1 when path isn't one, else the whole file's size.
+int64_t splitFileSize(const std::string& path);
 
 }  // namespace fsx

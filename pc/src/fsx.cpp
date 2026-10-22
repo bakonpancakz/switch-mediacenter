@@ -54,7 +54,20 @@ bool rename(const std::string& from, const std::string& to) {
     return MoveFileExW(winPath(from).c_str(), winPath(to).c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
 }
 
-void walk(const std::string& root, const std::function<void(const std::string&, uint64_t, bool)>& fn) {
+int64_t splitFileSize(const std::string& path) {
+    DWORD a = GetFileAttributesW(winPath(path).c_str());
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY) || !(a & FILE_ATTRIBUTE_ARCHIVE)) return -1;
+    int64_t total = 0;
+    for (int i = 0;; i++) {
+        char part[8];
+        snprintf(part, sizeof(part), "/%02d", i);
+        int64_t n = size(path + part);
+        if (n < 0) return i ? total : -1;
+        total += n;
+    }
+}
+
+void walk(const std::string& root, const std::function<void(const std::string&, uint64_t, bool)>& fn, bool splitFiles) {
     std::vector<std::string> todo = {""};
     while (!todo.empty()) {
         std::string rel = todo.back();
@@ -66,6 +79,13 @@ void walk(const std::string& root, const std::function<void(const std::string&, 
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
             std::string r = rel.empty() ? utf8(fd.cFileName) : rel + "/" + utf8(fd.cFileName);
             bool dir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
+            if (dir && splitFiles && (fd.dwFileAttributes & FILE_ATTRIBUTE_ARCHIVE)) {
+                int64_t n = splitFileSize(root + "/" + r);
+                if (n >= 0) {
+                    fn(r, (uint64_t)n, false);
+                    continue;
+                }
+            }
             fn(r, dir ? 0 : ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow, dir);
             if (dir) todo.push_back(r);
         } while (FindNextFileW(h, &fd));
