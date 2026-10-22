@@ -197,6 +197,35 @@ bool Library::pictureData(int64_t id, std::string& out) {
     return !out.empty();
 }
 
+bool Library::lockRow(int64_t item, LibLock& out) {
+    std::lock_guard<std::mutex> l(s_mx);
+    Q q("SELECT lock, salt, iterations, check_tag, numeric, nonce, data FROM locks WHERE item = ?");
+    if (!q.s) return false;  // a library from before locked folders
+    q.bind(1, item);
+    if (!q.step()) return false;
+    out.lock = q.str(0);
+    out.salt = q.blob(1);
+    out.iterations = q.i32(2);
+    out.check = q.str(3);
+    out.numeric = q.i32(4) != 0;
+    out.nonce = (uint64_t)q.i64(5);
+    out.data = q.blob(6);
+    return true;
+}
+
+bool Library::lockedPicture(int64_t id, std::string& data, uint64_t& nonce) {
+    std::lock_guard<std::mutex> l(s_mx);
+    Q q("SELECT nonce, data FROM locked_pictures WHERE id = ?");
+    if (!q.s) return false;
+    q.bind(1, id);
+    if (!q.step()) return false;
+    nonce = (uint64_t)q.i64(0);
+    const void* p = sqlite3_column_blob(q.s, 1);
+    int n = sqlite3_column_bytes(q.s, 1);
+    data.assign(p ? (const char*)p : "", p ? n : 0);
+    return !data.empty();
+}
+
 std::vector<LibShow> Library::shows() {
     std::lock_guard<std::mutex> l(s_mx);
     std::vector<LibShow> v;

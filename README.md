@@ -71,6 +71,14 @@ In handheld mode the photo viewer and books turn with the console (Settings → 
   24 megapixels, get a 2560 px copy made by the PC. Animated GIF, APNG and WebP play.
 - **Videos and music** play in the viewer. Music shows its cover with the same visualizer as the Spotify tab.
 - Files the PC couldn't read aren't synced, so there are no dead tiles; the sync log names them.
+- **Locked folders:** put a file named `.mediacenter_pin` in a folder, with a PIN (or a passphrase) inside. The sync
+  tool sends that folder encrypted: its files, names, thumbnails and details. On the Switch it's a padlock tile until
+  you enter the PIN, and it locks again when you leave it, switch tabs or press HOME. On the card, the files have
+  meaningless names and can't be opened. Delete the PIN file to unlock it for good; change it to change the PIN
+  (the next sync re-encrypts everything). Nothing on the PC is changed.
+
+  It keeps your pictures private from someone browsing the Switch or its SD card. A short PIN could still be guessed
+  by someone determined, with time and the card in hand, so use a longer one (or a passphrase) if that matters.
 
 ## Media
 

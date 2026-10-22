@@ -1,6 +1,7 @@
 #include "builder.h"
 
 #include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <condition_variable>
@@ -29,6 +30,9 @@ static const char* WORK_SCHEMA =
     // pictures made here (thumbnails, covers, converted photos) and TMDB's, by hash
     "CREATE TABLE IF NOT EXISTS blobs(hash TEXT PRIMARY KEY, data BLOB NOT NULL, width INTEGER NOT NULL DEFAULT 0,"
     " height INTEGER NOT NULL DEFAULT 0);"
+    // each locked folder's salt, kept so its names on the card stay the same from sync to sync
+    "CREATE TABLE IF NOT EXISTS lock_salts(mapping TEXT NOT NULL, rel TEXT NOT NULL, salt BLOB NOT NULL,"
+    " PRIMARY KEY(mapping, rel));"
     // the mirror of the USB days, no longer used (the card's system.db knows what's on it)
     "DROP TABLE IF EXISTS sw_files; DROP TABLE IF EXISTS sw_packs; DROP TABLE IF EXISTS sw_blobs; DROP TABLE IF EXISTS sw_meta;";
 
@@ -376,7 +380,8 @@ bool Builder::analyze() {
 std::vector<std::string> Model::pictures() const {
     std::set<std::string> s;
     auto add = [&](const std::string& h) { if (!h.empty()) s.insert(h); };
-    for (auto& i : items) add(i.thumb);
+    for (auto& i : items)
+        if (!i.lock) add(i.thumb);  // (a locked folder's go encrypted, on their own)
     for (auto& sh : shows) {
         add(sh.poster);
         add(sh.backdrop);
@@ -459,6 +464,51 @@ bool Builder::build(Model& out) {
             return id;
         };
 
+        // Locked folders: the outermost folder holding a PIN file locks all in it.
+        // (Files mappings only, and not the mapping's own top folder.)
+        std::map<std::string, int> lockOfDir;  // folder -> its lock (1-based in out.locks), 0 = none
+        std::function<int(const std::string&)> lockFor = [&](const std::string& relDir) -> int {
+            if (m.category != lib::C_FILES || relDir.empty()) return 0;
+            auto known = lockOfDir.find(relDir);
+            if (known != lockOfDir.end()) return known->second;
+            size_t s = relDir.find_last_of('/');
+            int lock = s == std::string::npos ? 0 : lockFor(relDir.substr(0, s));
+            if (!lock) {
+                std::vector<uint8_t> pinData;
+                if (readWhole(root + "/" + relDir + "/" + lockbox::PIN_FILE, pinData)) {
+                    std::string pin = trim(std::string(pinData.begin(), pinData.end()));
+                    if (pin.compare(0, 3, "\xEF\xBB\xBF") == 0) pin = trim(pin.substr(3));  // a UTF-8 BOM (Notepad)
+                    if (pin.empty()) logLine("the PIN file in " + m.name + "/" + relDir + " is empty: that folder isn't locked");
+                    else {
+                        MLock L;
+                        Stmt get = m_db.prepare("SELECT salt FROM lock_salts WHERE mapping = ? AND rel = ?");
+                        get.bind(1, m.id).bind(2, relDir);
+                        if (get.step()) L.salt = get.blob(0);
+                        if (L.salt.size() != 16) {
+                            L.salt.assign(16, 0);
+                            BCryptGenRandom(nullptr, L.salt.data(), 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                            m_db.prepare("INSERT OR REPLACE INTO lock_salts(mapping, rel, salt) VALUES(?, ?, ?)")
+                                .bind(1, m.id).bind(2, relDir).bind(3, L.salt).run();
+                        }
+                        L.keys.derive(pin, L.salt.data(), L.salt.size(), lockbox::ITERATIONS);
+                        L.numeric = pin.find_first_not_of("0123456789") == std::string::npos;
+                        L.id = L.keys.tag("folder", 16);
+                        L.name = s == std::string::npos ? relDir : relDir.substr(s + 1);
+                        MItem& folder = out.items[dirFor(relDir) - 1];
+                        folder.kind = lib::K_LOCKED;
+                        folder.name = "Locked folder";  // the real one is encrypted
+                        folder.sort = lib::sortKey(folder.name);  // (not by the real name: its place would hint at it)
+                        folder.path = r.dir + "/" + lib::LOCKED_DIR + "/" + L.id;
+                        L.item = folder.id;
+                        out.locks.push_back(std::move(L));
+                        lock = (int)out.locks.size();
+                    }
+                }
+            }
+            lockOfDir[relDir] = lock;
+            return lock;
+        };
+
         std::vector<VideoFile> videos;
         int skipped = 0;
         Stmt blobSize = m_db.prepare("SELECT length(data) FROM blobs WHERE hash = ?");
@@ -491,6 +541,17 @@ bool Builder::build(Model& out) {
                     f.size = (uint64_t)blobSize.i64(0);
                 }
                 blobSize.reset();
+            }
+            // in a locked folder: encrypted, under a name that says nothing (the extension stays)
+            {
+                size_t slash = rel.find_last_of('/');
+                f.lock = lockFor(slash == std::string::npos ? "" : rel.substr(0, slash));
+                if (f.lock) {
+                    const MLock& L = out.locks[f.lock - 1];
+                    std::string ext = extOf(f.remote);
+                    f.nonce = L.keys.nonceFor(rel + "|" + std::to_string(f.size) + "|" + std::to_string(f.mtime));
+                    f.remote = r.dir + "/" + lib::LOCKED_DIR + "/" + L.id + "/" + L.keys.tag(rel, 24) + (ext.empty() ? "" : "." + ext);
+                }
             }
             out.files.push_back(f);
             if (kind == SIDECAR) continue;  // copied, not listed
@@ -530,6 +591,17 @@ bool Builder::build(Model& out) {
         if (skipped) m_warnings.push_back(std::to_string(skipped) + " file(s) in " + m.name + " couldn't be read, so they're left off the Switch");
     }
 
+    // everything inside a locked folder belongs to it (parents come before their children)
+    for (size_t li = 0; li < out.locks.size(); li++) out.items[out.locks[li].item - 1].lock = 0;
+    std::vector<int> lockAt(out.items.size() + 1, 0);
+    for (size_t li = 0; li < out.locks.size(); li++) lockAt[out.locks[li].item] = (int)li + 1;
+    for (auto& it : out.items) {
+        if (!it.parent) continue;
+        const MItem& p = out.items[it.parent - 1];
+        int l = p.kind == lib::K_LOCKED ? lockAt[p.id] : p.lock;
+        if (l) it.lock = l;
+    }
+
     // folders: how many entries, and a picture from inside them
     std::vector<std::vector<int>> kids(out.items.size() + 1);
     for (auto& it : out.items)
@@ -553,6 +625,7 @@ bool Builder::build(Model& out) {
                 fromFile = ci.thumb;
         }
         d.thumb = fromFile.empty() ? fromDir : fromFile;
+        if (d.kind == lib::K_LOCKED) d.thumb.clear();  // a padlock: nothing from inside shows outside
         return d.thumb;
     };
     for (auto& r : out.roots) folderThumb(r.item);

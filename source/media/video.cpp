@@ -3,6 +3,7 @@
 #include <mpv/client.h>
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
+#include <mpv/stream_cb.h>
 extern "C" {
 #include <libavutil/log.h>
 }
@@ -11,6 +12,35 @@ extern "C" {
 #include <cstdio>
 #include <mutex>
 #include <cstring>
+
+#include "core/locks.h"
+
+// A locked folder's files go to mpv as mclock://<path>: it reads them through
+// locks::LockedFile, which decrypts at whatever offset it asks for (so seeking works).
+static const char* LOCKED_PROTOCOL = "mclock";
+
+static int64_t lockedRead(void* cookie, char* buf, uint64_t n) { return ((locks::LockedFile*)cookie)->read(buf, (size_t)n); }
+static int64_t lockedSeek(void* cookie, int64_t to) {
+    return to >= 0 && ((locks::LockedFile*)cookie)->seek((uint64_t)to) ? to : MPV_ERROR_GENERIC;
+}
+static int64_t lockedSize(void* cookie) { return (int64_t)((locks::LockedFile*)cookie)->size(); }
+static void lockedClose(void* cookie) { delete (locks::LockedFile*)cookie; }
+
+static int openLocked(void*, char* uri, mpv_stream_cb_info* info) {
+    std::string prefix = std::string(LOCKED_PROTOCOL) + "://";
+    std::string path = std::string(uri).substr(std::min(prefix.size(), strlen(uri)));
+    auto* f = new locks::LockedFile;
+    if (!f->open(path)) {
+        delete f;
+        return MPV_ERROR_LOADING_FAILED;
+    }
+    info->cookie = f;
+    info->read_fn = lockedRead;
+    info->seek_fn = lockedSeek;
+    info->size_fn = lockedSize;
+    info->close_fn = lockedClose;
+    return 0;
+}
 
 static std::atomic<bool> s_redraw{false};
 
@@ -308,6 +338,7 @@ bool Video::init() {
         return false;
     }
     av_log_set_callback(appAvLog);  // see appAvLog
+    mpv_stream_cb_add_ro(m_mpv, LOCKED_PROTOCOL, nullptr, openLocked);  // a locked folder's videos and songs
     mpv_observe_property(m_mpv, 1, "time-pos", MPV_FORMAT_DOUBLE);
     mpv_observe_property(m_mpv, 2, "duration", MPV_FORMAT_DOUBLE);
     mpv_observe_property(m_mpv, 3, "pause", MPV_FORMAT_FLAG);
@@ -387,7 +418,9 @@ void Video::load(const std::string& path, double startSec, Mode mode) {
     opt("alang", media ? cfgStr("media.alang", "jpn,ja,eng,en") : "");
     opt("sub-scale", media ? std::to_string(cfgInt("media.sub_scale", 100) / 100.0) : "1");
     // mpv 0.39: loadfile <url> <flags> <index> <options> (the index is unused with replace)
-    const char* cmd[] = {"loadfile", path.c_str(), "replace", "-1", opts.c_str(), nullptr};
+    uint64_t nonce;
+    std::string url = locks::fileNonce(path, nonce) ? std::string(LOCKED_PROTOCOL) + "://" + path : path;  // decrypted as mpv reads
+    const char* cmd[] = {"loadfile", url.c_str(), "replace", "-1", opts.c_str(), nullptr};
     mpv_command_async(m_mpv, LOADFILE_REPLY, cmd);
 }
 

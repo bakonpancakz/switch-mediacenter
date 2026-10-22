@@ -18,6 +18,7 @@
 #include <set>
 
 #include "core/thread.h"
+#include "core/locks.h"
 #include "media/audio_tap.h"
 #include "media/video.h"
 #include "spotify/sp_visual.hpp"
@@ -99,6 +100,17 @@ public:
             if (kv.second.tex) SDL_DestroyTexture(kv.second.tex);
         m_cache.clear();
     }
+    // Everything, including what's queued or decoded and not yet collected (a locked folder closing).
+    void dropAll() {
+        {
+            std::lock_guard<std::mutex> l(m_mx);
+            m_queue.clear();
+            for (auto& r : m_done)
+                if (r.surf) SDL_FreeSurface(r.surf);
+            m_done.clear();
+        }
+        clear();
+    }
 
 private:
     struct Job { std::string path; int ow = 0, oh = 0; };
@@ -124,7 +136,13 @@ private:
                 m_busy = j.path;
             }
             int ow = j.ow, oh = j.oh;
-            SDL_Surface* s = loadImage(j.path, 2560, 2560, &ow, &oh);
+            SDL_Surface* s;
+            uint64_t nonce;
+            if (locks::fileNonce(j.path, nonce)) {  // a locked folder's: decrypted in memory
+                std::string data;
+                s = locks::readFile(j.path, data) ? loadImageMem(data.data(), data.size(), 2560, 2560, &ow, &oh) : nullptr;
+            } else
+                s = loadImage(j.path, 2560, 2560, &ow, &oh);
             if (s && (ow <= 0 || oh <= 0)) { ow = s->w; oh = s->h; }
             std::lock_guard<std::mutex> l(m_mx);
             m_busy.clear();
@@ -333,6 +351,15 @@ public:
         closed = true;
         m_slideshow = false;
         m_anim.reset();
+    }
+    // A locked folder closed: nothing decrypted stays (pictures, animations, the visualizer's decoder).
+    void forget() {
+        close();
+        m_loader.dropAll();
+        m_animated.clear();
+        m_audio.stop();
+        items.clear();
+        index = 0;
     }
 
 private:
@@ -683,7 +710,10 @@ private:
         row("Size", size);
         if (it.taken) row(it.kind == lib::K_IMAGE ? "Taken" : "Recorded", dateText(it.taken, it.kind == lib::K_IMAGE));
         else row("Modified", dateText(it.mtime));
-        row("Folder", dirName(it.path).substr(std::string(APP_DIR).size() + 1));
+        uint64_t nonce;
+        auto open = locks::current();
+        if (open && locks::fileNonce(it.path, nonce)) row("Folder", open->name);  // (its path on the card says nothing)
+        else row("Folder", dirName(it.path).substr(std::string(APP_DIR).size() + 1));
         // it takes all input while open, so any tap (on it or not) or B closes it
         if (g_in.back || (g_in.tap && !g_in.consumed)) m_info = false;
         g_in.consumed = true;
@@ -704,6 +734,7 @@ public:
     void leave() override {
         if (m_viewing && m_photo.slideshow()) m_photo.close();
         if (m_viewing) m_photo.pauseVideo();
+        if (locks::current()) leaveLocked();  // switching tabs, the HOME menu, sleep: it locks again
     }
     void shutdown() override {
         m_photo.stopVideo();
@@ -719,6 +750,7 @@ public:
     }
     void draw(const SDL_Rect& area) override {
         refresh();
+        if (m_lockFolder && !locks::isOpen(m_lockFolder)) leaveLocked();  // locked again from elsewhere
         if (m_viewing) {
             m_photo.draw();
             if (m_photo.closed) m_viewing = false;
@@ -738,6 +770,38 @@ private:
     uint32_t m_version = 0;
     Scroller m_scroll;
     PhotoViewer m_photo;
+    int64_t m_lockFolder = 0;  // the locked folder we're in (open), or 0
+
+    static bool isFolder(const LibItem& e) { return e.kind == lib::K_DIR || e.kind == lib::K_LOCKED; }
+
+    // Out of an open locked folder: locked again, and back to where it sits.
+    void leaveLocked() {
+        int64_t folder = m_lockFolder ? m_lockFolder : (locks::current() ? locks::current()->folder : 0);
+        bool inside = m_lockFolder != 0;
+        m_lockFolder = 0;
+        m_viewing = false;
+        m_photo.forget();
+        locks::lock();
+        if (inside) {
+            LibItem f;
+            open(folder && Library::get().item(folder, f) && f.parent ? f.parent : home());
+        }
+    }
+
+    // A locked folder tapped: its PIN, then in.
+    void unlockFolder(const LibItem& e) {
+        if (locks::isOpen(e.id)) {
+            open(e.id);
+            return;
+        }
+        std::string pin;
+        if (!keyboard("PIN for this locked folder", "", pin, 64, locks::numericPin(e.id), true) || pin.empty()) return;
+        switch (locks::unlock(e.id, pin)) {
+        case locks::OPENED: open(e.id); break;
+        case locks::WRONG_PIN: toast("Wrong PIN"); break;
+        default: toast("Couldn't open this locked folder. Sync it again from the PC"); break;
+        }
+    }
 
     enum SortBy { BY_NAME, BY_DATE, BY_SIZE, BY_LENGTH, BY_TYPE };
     enum GroupBy { GROUP_NONE, GROUP_TYPE, GROUP_MONTH };
@@ -755,6 +819,7 @@ private:
         m_roots = Library::get().roots(lib::C_FILES);
         std::string last = cfgStr("files.last_dir", "");
         LibItem it;
+        if (m_lockFolder) leaveLocked();  // a new library: ids mean other things now
         if (!last.empty() && Library::get().itemByPath(last, it) && it.kind == lib::K_DIR) open(it.id, true);
         else open(home(), true);
     }
@@ -763,10 +828,20 @@ private:
     int64_t home() const { return m_roots.size() == 1 ? m_roots[0].item : 0; }
 
     void open(int64_t dir, bool keepScroll = false) {
+        // leaving an open locked folder locks it again
+        if (m_lockFolder && dir != m_lockFolder && dir >= 0) {
+            m_lockFolder = 0;
+            m_photo.forget();
+            locks::lock();
+        }
+        bool locked = dir && locks::inside(dir);
+        if (locked) m_lockFolder = locks::current()->folder;
         m_dir = dir;
         m_dirItem = LibItem();
-        if (dir) Library::get().item(dir, m_dirItem);
-        if (dir) m_entries = Library::get().children(dir);
+        if (dir < 0) locks::item(dir, m_dirItem);
+        else if (dir) Library::get().item(dir, m_dirItem);
+        if (locked) m_entries = locks::children(dir);
+        else if (dir) m_entries = Library::get().children(dir);
         else {
             m_entries.clear();
             for (auto& r : m_roots) {
@@ -776,8 +851,14 @@ private:
         }
         arrange();
         if (!keepScroll) m_scroll = Scroller();
-        // (not while a sync has the library closed: the place to come back to is still the old one)
-        if (Library::get().ready()) cfgSet("files.last_dir", dir ? m_dirItem.path : "");
+        // (not while a sync has the library closed: the place to come back to is still the old one;
+        // and never inside a locked folder: where it sits)
+        if (Library::get().ready()) {
+            std::string where = dir ? m_dirItem.path : "";
+            LibItem f, p;
+            if (locked && Library::get().item(m_lockFolder, f) && Library::get().item(f.parent, p)) where = p.path;
+            if (!locked || !where.empty()) cfgSet("files.last_dir", where);
+        }
     }
 
     void up() {
@@ -790,7 +871,7 @@ private:
 
     // Which heading an entry goes under, as a rank (the order of the headings) and a label.
     static std::pair<int64_t, std::string> groupOf(const LibItem& e, int group, bool newestFirst) {
-        if (e.kind == lib::K_DIR) return {INT64_MIN, "Folders"};
+        if (isFolder(e)) return {INT64_MIN, "Folders"};
         if (group == GROUP_TYPE) {
             static const char* names[] = {"", "Photos", "Videos", "Music", "Books"};
             return {e.kind, names[SDL_clamp(e.kind, 0, 4)]};
@@ -824,7 +905,7 @@ private:
         };
         std::vector<std::pair<int64_t, std::string>> groups(m_entries.size());
         for (size_t i = 0; i < m_entries.size(); i++)
-            groups[i] = group == GROUP_NONE ? std::pair<int64_t, std::string>(m_entries[i].kind == lib::K_DIR ? 0 : 1, "")
+            groups[i] = group == GROUP_NONE ? std::pair<int64_t, std::string>(isFolder(m_entries[i]) ? 0 : 1, "")
                                             : groupOf(m_entries[i], group, newestFirst);
         std::vector<size_t> order(m_entries.size());
         for (size_t i = 0; i < order.size(); i++) order[i] = i;
@@ -834,7 +915,7 @@ private:
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
             if (groups[a].first != groups[b].first) return groups[a].first < groups[b].first;
             const LibItem &x = m_entries[a], &y = m_entries[b];
-            if (x.kind == lib::K_DIR) return a < b;
+            if (isFolder(x)) return a < b;
             if (by == BY_NAME) return reverse ? a > b : a < b;
             int64_t kx = key(x), ky = key(y);
             if (kx != ky) return descending ? kx > ky : kx < ky;
@@ -863,7 +944,7 @@ private:
     static int layoutMode() { return SDL_clamp(cfgInt("files.layout", L_MASONRY), 0, 2); }
     static int tileSize() { return SDL_clamp(cfgInt("files.tile_size", 1), 0, 2); }  // small, medium, large
     static bool showExt() { return cfgBool("files.show_ext", false); }
-    static std::string label(const LibItem& e) { return e.kind == lib::K_DIR || showExt() ? e.name : fileStem(e.name); }
+    static std::string label(const LibItem& e) { return isFolder(e) || showExt() ? e.name : fileStem(e.name); }
 
     struct Placed { int entry; SDL_Rect r; };  // entry < 0: the heading of group -entry - 1
     std::vector<Placed> m_placed;
@@ -974,6 +1055,7 @@ private:
 
     void openEntry(const LibItem& e) {
         if (e.kind == lib::K_DIR) { open(e.id); return; }
+        if (e.kind == lib::K_LOCKED) { unlockFolder(e); return; }
         if (e.kind == lib::K_BOOK) {
             toast("Books open in the Books tab");
             return;
@@ -988,6 +1070,11 @@ private:
 
     // a folder: its icon, or (when folders may show pictures) one from inside with a folder badge
     void drawFolderThumb(const LibItem& e, const SDL_Rect& th, bool down, int radius, int iconSize) {
+        if (e.kind == lib::K_LOCKED) {  // a padlock, never a picture
+            fillRound(th, radius, down ? g_theme.line : g_theme.panel2);
+            drawIcon(IC_LOCK, th.x + th.w / 2.0f, th.y + th.h / 2.0f, (float)iconSize, g_theme.accent);
+            return;
+        }
         if (folderPictures() && drawPicture(e.thumb, th, radius, down ? 120 : 170)) {
             fillCircle(th.x + 34.0f, th.y + th.h - 34.0f, 24, SDL_Color{0, 0, 0, 160});
             drawIcon(IC_FOLDER, th.x + 34.0f, th.y + th.h - 34.0f, 26, g_theme.accent);
@@ -1006,7 +1093,7 @@ private:
         bool down = pressing(row);
         fillRound(row, 14, down ? g_theme.line : g_theme.panel);
         SDL_Rect th = {row.x + 8, row.y + 8, (row.h - 16) * 4 / 3, row.h - 16};
-        if (e.kind == lib::K_DIR) drawFolderThumb(e, th, down, 10, th.h * 2 / 5);
+        if (isFolder(e)) drawFolderThumb(e, th, down, 10, th.h * 2 / 5);
         else if (!drawPicture(e.thumb, th, 10)) {
             fillRound(th, 10, g_theme.panel2);
             if (e.kind == lib::K_AUDIO && !e.wave.empty()) drawWave(e.wave, {th.x + 10, th.y + 14, th.w - 20, th.h - 28}, g_theme.accent);
@@ -1014,7 +1101,8 @@ private:
         }
         int tx = th.x + th.w + 20, tw = row.x + row.w - tx - 20;
         std::string sub;
-        if (e.kind == lib::K_DIR) sub = std::to_string(e.children) + (e.children == 1 ? " item" : " items");
+        if (e.kind == lib::K_LOCKED) sub = "Locked";
+        else if (e.kind == lib::K_DIR) sub = std::to_string(e.children) + (e.children == 1 ? " item" : " items");
         else {
             if (e.duration > 0) sub = durationText(e.duration) + "  \xC2\xB7  ";
             sub += formatBytes((double)e.size);
@@ -1036,7 +1124,7 @@ private:
         SDL_Rect th = {tile.x, tile.y, tile.w, thumbH};
         bool down = pressing(tile);
         bool small = tile.w < 200;
-        if (e.kind == lib::K_DIR) drawFolderThumb(e, th, down, 14, small ? 52 : 72);
+        if (isFolder(e)) drawFolderThumb(e, th, down, 14, small ? 52 : 72);
         else {
             if (!drawPicture(e.thumb, th, 14, down ? 170 : 255)) {
                 fillRound(th, 14, down ? g_theme.line : g_theme.panel2);
@@ -1089,7 +1177,7 @@ private:
         for (const Placed& p : m_placed)
             if (p.entry >= 0 && p.r.y + p.r.h > m_scroll.pos) { e = &m_entries[p.entry]; break; }
         if (!e) return "";
-        if (e->kind == lib::K_DIR) return "Folders";
+        if (isFolder(*e)) return "Folders";
         switch (sortBy()) {
         case BY_DATE: return groupOf(*e, GROUP_MONTH, true).second;
         case BY_SIZE: return formatBytes((double)e->size);
@@ -1121,6 +1209,7 @@ private:
         }
         int tx = sub ? x0 + 64 : x0;
         std::string title = m_dir ? m_dirItem.name : name();
+        if (m_lockFolder && m_dir == m_lockFolder && locks::current()) title = locks::current()->name;
         drawText(title, tx, 26, 36, g_theme.fg, 0, area.w - 560 - (tx - x0), FS_BOLD);
         int media = 0;
         for (auto& e : m_entries) media += e.kind == lib::K_IMAGE || e.kind == lib::K_VIDEO;

@@ -1,5 +1,8 @@
 #include "anim.h"
 
+#include "core/locks.h"
+#include "media/media_input.h"
+
 #include <webp/decode.h>
 #include <webp/demux.h>
 
@@ -15,14 +18,16 @@ extern "C" {
 
 static const size_t kQueue = 3;  // frames decoded ahead
 
+// (a locked folder's files decrypted on the way: core/locks.h)
 static std::string readHead(const std::string& path, size_t n) {
     std::string s;
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return s;
-    s.resize(n);
-    s.resize(fread(&s[0], 1, n, f));
-    fclose(f);
+    locks::readFile(path, s, n);
     return s;
+}
+
+static bool readWhole(const std::string& path, std::string& out) {
+    out.clear();
+    return locks::readFile(path, out) && !out.empty();
 }
 
 static bool isWebpAnim(const uint8_t* d, size_t len) {
@@ -108,16 +113,10 @@ bool Animation::still() {
 }
 
 AVFormatContext* Animation::openInput() {
-    std::string url = "file:" + m_path;  // "sdmc:" would look like a protocol
-    AVFormatContext* fmt = avformat_alloc_context();
-    if (!fmt) return nullptr;
-    fmt->interrupt_callback.callback = interrupted;
-    fmt->interrupt_callback.opaque = this;
+    AVIOInterruptCB cb = {interrupted, this};
     // GIF and APNG say their size up front: probing megabytes of a big one from
     // the card only delayed the first frame
-    fmt->probesize = 256 * 1024;
-    if (avformat_open_input(&fmt, url.c_str(), nullptr, nullptr) < 0) return nullptr;  // (it frees fmt)
-    return fmt;
+    return openMediaInput(m_path, &cb, 256 * 1024);
 }
 
 bool Animation::failed() {
@@ -211,7 +210,7 @@ void Animation::run() {
     if (!animated) return;
     std::string head = readHead(m_path, 32);
     bool webp = isWebpAnim((const uint8_t*)head.data(), head.size());
-    if (webp && (!readFile(m_path, m_data) || m_data.empty() || m_data.size() > (64u << 20))) {
+    if (webp && (!readWhole(m_path, m_data) || m_data.size() > (64u << 20))) {
         std::lock_guard<std::mutex> l(m_mx);
         m_failed = true;
         return;
@@ -264,7 +263,7 @@ void Animation::measure() {
     std::string head = readHead(m_path, 32), data;
     bool webp = isWebpAnim((const uint8_t*)head.data(), head.size());
     if (webp) {
-        if (!readFile(m_path, data)) return;
+        if (!readWhole(m_path, data)) return;
         WebPData wd = {(const uint8_t*)data.data(), data.size()};
         WebPDemuxer* dmx = WebPDemux(&wd);
         WebPIterator it;
@@ -293,7 +292,7 @@ void Animation::measure() {
                 }
                 av_packet_free(&pkt);
             }
-            avformat_close_input(&fmt);
+            closeMediaInput(&fmt);
         }
     }
     std::lock_guard<std::mutex> l(m_mx);
@@ -396,7 +395,7 @@ Animation::Pass Animation::passFfmpeg(int startAt, int& frames) {
     av_packet_free(&pkt);
     av_frame_free(&fr);
     if (cc) avcodec_free_context(&cc);
-    avformat_close_input(&fmt);
+    closeMediaInput(&fmt);
     if (result == P_END && frames == 0) return P_FAIL;
     return result;
 }

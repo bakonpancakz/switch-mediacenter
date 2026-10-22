@@ -62,6 +62,16 @@ struct LibBook {
     std::string title, author, path;
 };
 
+// A locked folder's row (see shared/lockbox.h): what unlocking it needs.
+struct LibLock {
+    std::string lock;  // names its folder on the card
+    std::vector<uint8_t> salt, data;
+    int iterations = 0;
+    std::string check;
+    bool numeric = true;  // the PIN is all digits
+    uint64_t nonce = 0;
+};
+
 class Library {
 public:
     static Library& get();
@@ -80,6 +90,8 @@ public:
     // Folders first, then by name (sort keys made on the PC).
     std::vector<LibItem> children(int64_t parent);
     bool pictureData(int64_t id, std::string& out);  // the JPEG bytes
+    bool lockRow(int64_t item, LibLock& out);         // a locked folder's (false for a library without them)
+    bool lockedPicture(int64_t id, std::string& data, uint64_t& nonce);  // still encrypted
 
     std::vector<LibShow> shows();  // with seasons and episodes
     std::vector<LibMovie> movies();

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "app.h"
+#include "media/media_input.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -110,12 +111,9 @@ int interrupted(void* p) {
 
 void AudioTap::decode(const std::string& path, double at, uint32_t gen) {
     Watch watch{&m_mx, &m_quit, &m_gen, gen};
-    AVFormatContext* fmt = avformat_alloc_context();
+    AVIOInterruptCB cb = {interrupted, &watch};
+    AVFormatContext* fmt = openMediaInput(path, &cb);  // (a locked folder's song decrypted as it's read)
     if (!fmt) return;
-    fmt->interrupt_callback.callback = interrupted;
-    fmt->interrupt_callback.opaque = &watch;
-    std::string url = "file:" + path;  // "sdmc:" would look like a protocol
-    if (avformat_open_input(&fmt, url.c_str(), nullptr, nullptr) < 0) return;  // (it frees fmt)
     AVCodecContext* cc = nullptr;
     SwrContext* swr = nullptr;
     AVPacket* pkt = av_packet_alloc();
@@ -173,5 +171,5 @@ void AudioTap::decode(const std::string& path, double at, uint32_t gen) {
     av_packet_free(&pkt);
     swr_free(&swr);
     avcodec_free_context(&cc);
-    avformat_close_input(&fmt);
+    closeMediaInput(&fmt);
 }

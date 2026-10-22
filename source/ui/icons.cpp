@@ -278,6 +278,12 @@ void drawIcon(int icon, float cx, float cy, float size, SDL_Color c) {
             line(6, 4, 6, 20); line(12, 4, 12, 20); line(18, 4, 18, 20);
             disc(6, 14.5f, 2.8f); disc(12, 8, 2.8f); disc(18, 16, 2.8f);
             break;
+        case IC_LOCK:  // a padlock
+            arc(12, 10.5f, 4.5f, 180, 360, 2.2f);
+            line(7.5f, 10.5f, 7.5f, 12, 2.2f);
+            line(16.5f, 10.5f, 16.5f, 12, 2.2f);
+            rect(4.5f, 11.5f, 15, 10, 2);
+            break;
         case IC_WAVE:  // spectrum bars
             rect(3, 10, 3, 10, 1.5f);
             rect(8, 4, 3, 16, 1.5f);

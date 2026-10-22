@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "lockbox.h"
+
 struct MItem {
     int id = 0, parent = 0, root = 0, kind = 0;
     std::string name, sort, path;
@@ -12,6 +14,17 @@ struct MItem {
     int width = 0, height = 0, children = 0;
     std::string thumb;  // picture hash
     std::vector<uint8_t> wave;
+    int lock = 0;       // inside a locked folder: its number in Model::locks (1-based)
+};
+
+// A folder with a PIN file (lockbox.h): its contents go to the card encrypted.
+struct MLock {
+    int item = 0;           // the folder (kind K_LOCKED, shown as a padlock)
+    std::string name;       // its real name, encrypted with the rest
+    std::string id;         // names its folder on the card (a tag: changes with the PIN)
+    std::vector<uint8_t> salt;
+    bool numeric = true;    // the PIN is all digits
+    lockbox::Keys keys;
 };
 
 struct MRoot {
@@ -58,6 +71,8 @@ struct MFile {
     std::string blob;    // when set, the file is this picture from work.db instead (a photo converted for the Switch)
     uint64_t size = 0;
     int64_t mtime = 0;   // PC last write (FILETIME ticks): a change means "send it again"
+    int lock = 0;        // in a locked folder: encrypted on the way, with this nonce
+    uint64_t nonce = 0;
 };
 
 struct Model {
@@ -67,5 +82,6 @@ struct Model {
     std::vector<MMovie> movies;
     std::vector<MBook> books;
     std::vector<MFile> files;
-    std::vector<std::string> pictures() const;  // every picture hash used, once
+    std::vector<MLock> locks;
+    std::vector<std::string> pictures() const;  // every picture hash used outside locked folders, once
 };

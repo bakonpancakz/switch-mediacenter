@@ -10,6 +10,7 @@
 #include "fsx.h"
 #include "images.h"
 #include "library.h"
+#include "lockbox.h"
 #include "sqlite3.h"
 #include "test.h"
 #include "util.h"
@@ -68,6 +69,16 @@ struct Db {
         std::string v;
         if (sqlite3_prepare_v2(db, sql.c_str(), -1, &s, nullptr) == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW && sqlite3_column_text(s, 0))
             v = (const char*)sqlite3_column_text(s, 0);
+        sqlite3_finalize(s);
+        return v;
+    }
+    std::vector<uint8_t> blob(const std::string& sql) {
+        sqlite3_stmt* s;
+        std::vector<uint8_t> v;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &s, nullptr) == SQLITE_OK && sqlite3_step(s) == SQLITE_ROW) {
+            auto* p = (const uint8_t*)sqlite3_column_blob(s, 0);
+            v.assign(p, p + sqlite3_column_bytes(s, 0));
+        }
         sqlite3_finalize(s);
         return v;
     }
@@ -311,6 +322,146 @@ TEST(big_files_are_split_for_fat32) {
     CHECK_EQ(again.copied, 0);
     CHECK_EQ(fsx::splitFileSize(split), 176478ll);
     splitForTests(0, 0);
+}
+
+// A small picture nothing else in the test has (so its thumbnail is its own).
+static void writeBmp(const std::string& path, int seed) {
+    const int w = 64, h = 48, row = w * 3;
+    std::vector<uint8_t> f(54 + row * h, 0);
+    auto put32 = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; i++) f[at + i] = (uint8_t)(v >> (8 * i)); };
+    f[0] = 'B';
+    f[1] = 'M';
+    put32(2, (uint32_t)f.size());
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, w);
+    put32(22, h);
+    f[26] = 1;
+    f[28] = 24;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            uint8_t* px = &f[54 + y * row + x * 3];
+            px[0] = (uint8_t)(x * 4 + seed);
+            px[1] = (uint8_t)(y * 5);
+            px[2] = (uint8_t)((x ^ y) * 3 + seed * 7);
+        }
+    fsx::mkdirs(path.substr(0, path.find_last_of('/')));
+    writeWhole(path, f.data(), f.size());
+}
+
+// What the Switch does to open a locked folder: the PIN against the check tag,
+// then its items decrypted. False for a wrong PIN.
+static bool unlock(Db& lib, const std::string& pin, lockbox::Keys& keys, std::string& name, std::vector<lockbox::Item>& items) {
+    std::vector<uint8_t> salt = lib.blob("SELECT salt FROM locks");
+    keys.derive(pin, salt.data(), salt.size(), (int)lib.num("SELECT iterations FROM locks"));
+    if (keys.check() != lib.text("SELECT check_tag FROM locks")) return false;
+    std::vector<uint8_t> data = lib.blob("SELECT data FROM locks");
+    keys.crypt((uint64_t)lib.num("SELECT nonce FROM locks"), 0, data.data(), data.size());
+    return lockbox::decodeItems(data, name, items);
+}
+
+TEST(locked_folder_goes_encrypted) {
+    writeBmp(g_pc + "/Pictures/Private/secret.bmp", 11);
+    copyFx("tone.wav", g_pc + "/Pictures/Private/Deeper/sound.wav");
+    touch(g_pc + "/Pictures/Private/" + lockbox::PIN_FILE, "1234\r\n");
+    SyncResult r = syncOnce(makeConfig());
+    CHECK(r.ok);
+
+    // nothing on the card or in its library says what's in there
+    bool leak = false;
+    fsx::walk(g_card + "/.media", [&](const std::string& rel, uint64_t, bool) {
+        for (const char* w : {"Private", "secret", "Deeper", "sound", "mediacenter_pin"})
+            if (rel.find(w) != std::string::npos) leak = true;
+    });
+    CHECK(!leak);
+    std::string name;
+    std::vector<lockbox::Item> items;
+    lockbox::Keys keys;
+    std::vector<uint8_t> secretPlain;
+    readWhole(g_pc + "/Pictures/Private/secret.bmp", secretPlain);
+    {
+        Db lib(g_card + "/system.db");
+        CHECK_EQ(lib.num("SELECT COUNT(*) FROM items WHERE name IN ('Private', 'secret.bmp', 'Deeper', 'sound.wav')"), 0ll);
+        CHECK_EQ(lib.num("SELECT COUNT(*) FROM items WHERE kind = 5"), 1ll);
+        CHECK_EQ(lib.text("SELECT name FROM items WHERE kind = 5"), std::string("Locked folder"));
+        CHECK_EQ(lib.num("SELECT children + thumb FROM items WHERE kind = 5"), 0ll);
+        CHECK_EQ(lib.num("SELECT COUNT(*) FROM locks"), 1ll);
+
+        lockbox::Keys wrong;
+        std::vector<lockbox::Item> none;
+        CHECK(!unlock(lib, "0000", wrong, name, none));  // a wrong PIN is refused
+        CHECK(unlock(lib, "1234", keys, name, items));
+        CHECK_EQ(name, std::string("Private"));
+        const lockbox::Item *secret = nullptr, *deeper = nullptr, *sound = nullptr;
+        for (auto& it : items) {
+            if (it.name == "secret.bmp") secret = &it;
+            if (it.name == "Deeper") deeper = &it;
+            if (it.name == "sound.wav") sound = &it;
+        }
+        CHECK(secret && deeper && sound);
+        if (secret && deeper && sound) {
+            CHECK(secret->parent == 0 && deeper->parent == 0 && sound->parent == deeper->id);
+            CHECK_EQ(deeper->children, 1);
+            // the file: encrypted on the card, the original once decrypted
+            std::vector<uint8_t> onCard;
+            CHECK(readWhole(g_card + "/" + secret->path, onCard));
+            CHECK(onCard != secretPlain);
+            keys.crypt(secret->nonce, 0, onCard.data(), onCard.size());
+            CHECK(onCard == secretPlain);
+            // its thumbnail: only in locked_pictures, and only encrypted
+            std::vector<uint8_t> thumb = lib.blob("SELECT data FROM locked_pictures WHERE id = " + std::to_string(secret->thumb));
+            CHECK(thumb.size() > 2);
+            keys.crypt((uint64_t)lib.num("SELECT nonce FROM locked_pictures WHERE id = " + std::to_string(secret->thumb)), 0,
+                       thumb.data(), thumb.size());
+            CHECK(thumb.size() > 2 && thumb[0] == 0xFF && thumb[1] == 0xD8);  // a JPEG
+            Image img;
+            CHECK(loadImageMemory(thumb.data(), thumb.size(), 0, img) && img.w > 0);
+            int64_t clash = 0;
+            sqlite3_stmt* st;
+            sqlite3_prepare_v2(lib.db, "SELECT COUNT(*) FROM pictures WHERE data = ?", -1, &st, nullptr);
+            sqlite3_bind_blob(st, 1, thumb.data(), (int)thumb.size(), SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW) clash = sqlite3_column_int64(st, 0);
+            sqlite3_finalize(st);
+            CHECK_EQ(clash, 0ll);  // not among the plain pictures (so not any folder's either)
+        }
+    }
+    CHECK(syncOnce(makeConfig()).nothingChanged);
+
+    // a lost library is rebuilt without sending them again
+    fsx::removeAll(g_card + "/system.db");
+    CHECK_EQ(syncOnce(makeConfig()).copied, 0);
+
+    // a new PIN: everything again under new names, the old ones gone
+    std::string oldPath;
+    for (auto& it : items)
+        if (it.name == "secret.bmp") oldPath = it.path;
+    touch(g_pc + "/Pictures/Private/" + lockbox::PIN_FILE, "5678");
+    r = syncOnce(makeConfig());
+    CHECK(r.ok);
+    CHECK(fsx::size(g_card + "/" + oldPath) < 0);
+    {
+        Db lib(g_card + "/system.db");
+        lockbox::Keys k;
+        std::vector<lockbox::Item> now;
+        CHECK(!unlock(lib, "1234", k, name, now));
+        CHECK(unlock(lib, "5678", k, name, now));
+        for (auto& it : now)
+            if (it.name == "secret.bmp") {
+                std::vector<uint8_t> onCard;
+                CHECK(readWhole(g_card + "/" + it.path, onCard));
+                k.crypt(it.nonce, 0, onCard.data(), onCard.size());
+                CHECK(onCard == secretPlain);
+            }
+    }
+
+    // unlocked again (the PIN file gone): plain, and the encrypted copies cleared
+    fsx::removeAll(g_pc + "/Pictures/Private/" + std::string(lockbox::PIN_FILE));
+    r = syncOnce(makeConfig());
+    CHECK(r.ok);
+    CHECK(!fsx::isDir(g_card + "/.media/files/Pictures/" + lib::LOCKED_DIR));
+    CHECK(fsx::size(g_card + "/.media/files/Pictures/Private/secret.bmp") > 0);
+    fsx::removeAll(g_pc + "/Pictures/Private");
+    CHECK(syncOnce(makeConfig()).ok);
 }
 
 int main() {

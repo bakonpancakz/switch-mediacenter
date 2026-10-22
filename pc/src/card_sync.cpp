@@ -59,6 +59,10 @@ bool openCardDb(Sql& db, const std::string& path, bool& fresh, std::string& erro
                 db.exec("PRAGMA journal_mode=DELETE");
                 db.exec("PRAGMA synchronous=FULL");
                 db.exec("PRAGMA cache_size=-32768");
+                if (!db.exec(lib::LOCKS_SQL)) {  // (libraries from before locked folders)
+                    error = "Couldn't update system.db: " + db.error();
+                    return false;
+                }
                 return true;
             }
         }
@@ -81,7 +85,7 @@ bool openCardDb(Sql& db, const std::string& path, bool& fresh, std::string& erro
     db.exec("PRAGMA journal_mode=DELETE");
     db.exec("PRAGMA synchronous=FULL");
     db.exec("PRAGMA cache_size=-32768");
-    if (!db.exec(lib::SCHEMA_SQL)) {
+    if (!db.exec(lib::SCHEMA_SQL) || !db.exec(lib::LOCKS_SQL)) {
         error = "Couldn't set up system.db: " + db.error();
         return false;
     }
@@ -115,6 +119,8 @@ std::string modelDigest(const Model& m) {
     }
     for (auto& mv : m.movies) { add(mv.title); num(mv.year); add(mv.overview); add(mv.poster); add(mv.backdrop); num(mv.runtime); num(mv.item); }
     for (auto& b : m.books) { add(b.title); add(b.author); add(b.cover); num(b.item); num(b.pages); }
+    for (auto& l : m.locks) { num(l.item); add(l.id); add(l.name); }
+    for (auto& i : m.items) num(i.lock);
     return hashHex(s.data(), s.size());
 }
 
@@ -130,6 +136,86 @@ DWORD CALLBACK copyProgress(LARGE_INTEGER, LARGE_INTEGER done, LARGE_INTEGER, LA
     if (*c->cancel) return PROGRESS_CANCEL;
     if (c->progress) c->progress((uint64_t)done.QuadPart);
     return PROGRESS_CONTINUE;
+}
+
+// Each locked folder: its items in locks (encrypted together) and its pictures
+// in locked_pictures (each encrypted). Pictures already there are kept; ones no
+// longer used, or under an old PIN, go. Inside the caller's transaction.
+bool writeLocks(Sql& card, Sql& work, const Model& model, const std::set<std::string>& present, const std::vector<int>& newId,
+                std::string& error) {
+    std::map<std::string, uint64_t> fileNonce;
+    for (auto& f : model.files)
+        if (f.lock) fileNonce[f.remote] = f.nonce;
+    std::map<std::pair<std::string, std::string>, int64_t> have;  // (lock, tag) -> row
+    {
+        Stmt q = card.prepare("SELECT lock, tag, id FROM locked_pictures");
+        while (q.step()) have[{q.str(0), q.str(1)}] = q.i64(2);
+    }
+    std::set<std::pair<std::string, std::string>> used;
+    Stmt blob = work.prepare("SELECT data, width, height FROM blobs WHERE hash = ?");
+    Stmt addPic = card.prepare("INSERT INTO locked_pictures(lock, tag, nonce, data, width, height) VALUES(?, ?, ?, ?, ?, ?)");
+    Stmt addLock = card.prepare(
+        "INSERT INTO locks(item, lock, salt, iterations, check_tag, numeric, nonce, data) VALUES(?, ?, ?, ?, ?, ?, ?, ?)");
+    if (!card.exec("DELETE FROM locks")) { error = "Couldn't clear locks"; return false; }
+    for (size_t li = 0; li < model.locks.size(); li++) {
+        const MLock& L = model.locks[li];
+        auto picture = [&](const std::string& hash) -> int64_t {
+            if (hash.empty()) return 0;
+            std::string tag = L.keys.tag("picture " + hash);
+            used.insert({L.id, tag});
+            auto h = have.find({L.id, tag});
+            if (h != have.end()) return h->second;
+            int64_t id = 0;
+            blob.bind(1, hash);
+            if (blob.step()) {
+                std::vector<uint8_t> data = blob.blob(0);
+                uint64_t nonce = L.keys.nonceFor("picture " + hash);
+                L.keys.crypt(nonce, 0, data.data(), data.size());
+                addPic.bind(1, L.id).bind(2, tag).bind(3, (int64_t)nonce).bind(4, data).bind(5, blob.i32(1)).bind(6, blob.i32(2)).run();
+                id = have[{L.id, tag}] = card.lastId();
+            }
+            blob.reset();
+            return id;
+        };
+        // its items, numbered from 1 within it (0: the locked folder); files once they're on the card
+        std::map<int, int64_t> local;
+        std::vector<lockbox::Item> list;
+        for (const MItem& it : model.items) {
+            if (it.lock != (int)li + 1) continue;
+            bool dir = it.kind == lib::K_DIR;
+            if (!dir && !present.count(it.path)) continue;
+            lockbox::Item x;
+            x.id = (int64_t)list.size() + 1;
+            local[it.id] = x.id;
+            x.parent = it.parent == L.item ? 0 : local[it.parent];
+            x.kind = it.kind;
+            x.name = it.name;
+            x.path = dir ? "" : it.path;
+            x.size = it.size;
+            x.mtime = it.mtime;
+            x.taken = it.taken;
+            x.duration = it.duration;
+            x.width = it.width;
+            x.height = it.height;
+            x.thumb = picture(it.thumb);
+            x.nonce = dir ? 0 : fileNonce[it.path];
+            x.wave = it.wave;
+            list.push_back(std::move(x));
+        }
+        std::map<int64_t, int> kids;
+        for (auto& x : list) kids[x.parent]++;
+        for (auto& x : list)
+            if (x.kind == lib::K_DIR) x.children = kids[x.id];
+        std::vector<uint8_t> data = lockbox::encodeItems(L.name, list);
+        uint64_t nonce = L.keys.nonceFor("items " + std::to_string(unixNow()) + " " + std::to_string(monoMs()));
+        L.keys.crypt(nonce, 0, data.data(), data.size());
+        addLock.bind(1, (int64_t)newId[L.item]).bind(2, L.id).bind(3, L.salt).bind(4, lockbox::ITERATIONS).bind(5, L.keys.check());
+        addLock.bind(6, L.numeric ? 1 : 0).bind(7, (int64_t)nonce).bind(8, data).run();
+    }
+    Stmt drop = card.prepare("DELETE FROM locked_pictures WHERE id = ?");
+    for (auto& [key, id] : have)
+        if (!used.count(key)) drop.bind(1, id).run();
+    return true;
 }
 
 // Writes the library tables (not `synced`): the items whose files are on the
@@ -179,7 +265,7 @@ bool writeLibrary(Sql& card, Sql& work, const Model& model, const std::set<std::
     std::vector<int> newId(model.items.size() + 1, 0);
     int next = 0;
     for (const MItem& it : model.items)
-        if (it.kind == lib::K_DIR || present.count(it.path)) newId[it.id] = ++next;
+        if (!it.lock && (it.kind == lib::K_DIR || it.kind == lib::K_LOCKED || present.count(it.path))) newId[it.id] = ++next;
     std::vector<int> children(model.items.size() + 1, 0);
     for (const MItem& it : model.items)
         if (newId[it.id] && it.parent) children[it.parent]++;
@@ -193,7 +279,7 @@ bool writeLibrary(Sql& card, Sql& work, const Model& model, const std::set<std::
         if (!newId[it.id]) continue;
         ii.bind(1, newId[it.id]).bind(2, it.parent ? newId[it.parent] : 0).bind(3, it.root).bind(4, it.kind).bind(5, it.name).bind(6, it.sort);
         ii.bind(7, it.path).bind(8, it.size).bind(9, it.mtime).bind(10, it.taken).bind(11, it.width).bind(12, it.height).bind(13, it.duration);
-        ii.bind(14, pic(it.thumb)).bind(15, it.wave).bind(16, it.kind == lib::K_DIR ? children[it.id] : 0).run();
+        ii.bind(14, pic(it.thumb)).bind(15, it.wave).bind(16, it.kind == lib::K_DIR ? children[it.id] : 0).run();  // (a locked folder: 0, 0)
     }
     Stmt sh = card.prepare("INSERT INTO shows(root, title, sort, year, overview, poster, backdrop, tmdb, added) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)");
     Stmt se = card.prepare("INSERT INTO seasons(show, number, title, ord) VALUES(?, ?, ?, ?)");
@@ -233,7 +319,7 @@ bool writeLibrary(Sql& card, Sql& work, const Model& model, const std::set<std::
         bo.bind(1, b.root).bind(2, newId[b.item]).bind(3, b.title).bind(4, b.author).bind(5, lib::sortKey(b.title)).bind(6, pic(b.cover));
         bo.bind(7, b.format).bind(8, b.pages).bind(9, b.added).run();
     }
-    return true;
+    return writeLocks(card, work, model, present, newId, error);
 }
 
 }  // namespace
@@ -245,16 +331,26 @@ void splitForTests(uint64_t over, uint64_t part) {
 
 bool copySplitFile(const std::string& src, const std::string& dstDir, uint64_t partSize, const std::atomic<bool>& cancel,
                    const std::function<void(uint64_t)>& progress, unsigned long& error) {
+    return copyFileThrough(src, dstDir, partSize, nullptr, cancel, progress, error);
+}
+
+bool copyFileThrough(const std::string& src, const std::string& dstDir, uint64_t partSize,
+                     const std::function<void(uint8_t*, size_t, uint64_t)>& transform, const std::atomic<bool>& cancel,
+                     const std::function<void(uint64_t)>& progress, unsigned long& error) {
     error = 0;
+    bool split = partSize > 0;
     HANDLE in = CreateFileW(winPath(src).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (in == INVALID_HANDLE_VALUE) {
         error = GetLastError();
         return false;
     }
-    bool ok = CreateDirectoryW(winPath(dstDir).c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
-    // the archive attribute is what makes the folder a file to the Switch
-    if (ok) ok = SetFileAttributesW(winPath(dstDir).c_str(), FILE_ATTRIBUTE_ARCHIVE) != 0;
-    if (!ok) error = GetLastError();
+    bool ok = true;
+    if (split) {
+        ok = CreateDirectoryW(winPath(dstDir).c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+        // the archive attribute is what makes the folder a file to the Switch
+        if (ok) ok = SetFileAttributesW(winPath(dstDir).c_str(), FILE_ATTRIBUTE_ARCHIVE) != 0;
+        if (!ok) error = GetLastError();
+    }
     LARGE_INTEGER total = {};
     if (ok && !GetFileSizeEx(in, &total)) {
         error = GetLastError();
@@ -262,11 +358,13 @@ bool copySplitFile(const std::string& src, const std::string& dstDir, uint64_t p
     }
     std::vector<uint8_t> buf(4 << 20);
     uint64_t done = 0, size = (uint64_t)total.QuadPart;
+    if (!split) partSize = std::max<uint64_t>(size, 1);  // one part: the file itself
     int parts = (int)std::max<uint64_t>(1, (size + partSize - 1) / partSize);
     for (int part = 0; ok && part < parts; part++) {
         char name[8];
         snprintf(name, sizeof(name), "/%02d", part);
-        HANDLE out = CreateFileW(winPath(dstDir + name).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        std::string partPath = split ? dstDir + name : dstDir;
+        HANDLE out = CreateFileW(winPath(partPath).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (out == INVALID_HANDLE_VALUE) {
             error = GetLastError();
             ok = false;
@@ -281,13 +379,16 @@ bool copySplitFile(const std::string& src, const std::string& dstDir, uint64_t p
             } else if (!ReadFile(in, buf.data(), (DWORD)std::min<uint64_t>(buf.size(), left), &got, nullptr) || got == 0) {
                 error = got == 0 ? ERROR_HANDLE_EOF : GetLastError();  // (shorter than it said: changed while copying)
                 ok = false;
-            } else if (!WriteFile(out, buf.data(), got, &wrote, nullptr) || wrote != got) {
-                error = GetLastError();
-                ok = false;
             } else {
-                left -= got;
-                done += got;
-                if (progress) progress(done);
+                if (transform) transform(buf.data(), got, done);  // (done: where this buffer starts in the file)
+                if (!WriteFile(out, buf.data(), got, &wrote, nullptr) || wrote != got) {
+                    error = GetLastError();
+                    ok = false;
+                } else {
+                    left -= got;
+                    done += got;
+                    if (progress) progress(done);
+                }
             }
         }
         CloseHandle(out);
@@ -450,6 +551,7 @@ SyncResult syncToCard(Sql& work, const Model& model, const std::string& root, co
             blob.bind(1, f->blob);
             std::vector<uint8_t> data = blob.step() ? blob.blob(0) : std::vector<uint8_t>();
             blob.reset();
+            if (f->lock) model.locks[f->lock - 1].keys.crypt(f->nonce, 0, data.data(), data.size());
             ok = !data.empty() && writeWhole(tmp, data.data(), data.size());
             if (!ok) code = GetLastError();
         } else {
@@ -459,11 +561,18 @@ SyncResult syncToCard(Sql& work, const Model& model, const std::string& root, co
                             pr.bytesDone = base + done;
                             if (progress && monoMs() - lastReport > 150) { lastReport = monoMs(); progress(pr); }
                         }};
-            if (f->size > splitOver) {
+            if (f->lock || f->size > splitOver) {
+                // through our own copy: encrypted (a locked folder's), or split for FAT32, or both
+                std::function<void(uint8_t*, size_t, uint64_t)> encrypt;
+                if (f->lock) {
+                    const lockbox::Keys& keys = model.locks[f->lock - 1].keys;
+                    uint64_t nonce = f->nonce;
+                    encrypt = [&keys, nonce](uint8_t* p, size_t n, uint64_t at) { keys.crypt(nonce, at, p, n); };
+                }
                 unsigned long err = 0;
-                ok = copySplitFile(f->local, tmp, splitPart, cancel, ctx.progress, err);
+                ok = copyFileThrough(f->local, tmp, f->size > splitOver ? splitPart : 0, encrypt, cancel, ctx.progress, err);
                 code = err;
-                if (ok) logLine("split for FAT32: " + f->remote);
+                if (ok && f->size > splitOver) logLine("split for FAT32: " + f->remote);
             } else {
                 ok = CopyFileExW(winPath(f->local).c_str(), winPath(tmp).c_str(), copyProgress, &ctx, nullptr, 0) != 0;
                 if (!ok) code = GetLastError();

@@ -135,7 +135,7 @@ enum Icon {
     IC_SUBS, IC_AUDIO, IC_FWD, IC_RWD, IC_SLIDES, IC_INFO, IC_DEVICE, IC_REFRESH, IC_QR, IC_ZOOM, IC_POWER,
     IC_TEXT, IC_FILE, IC_LINK, IC_UP, IC_DOWN, IC_SHUFFLE, IC_FIT, IC_MOON, IC_COMIC, IC_HOME, IC_LOGOUT,
     IC_WARN, IC_CLOUD, IC_PAUSECIRCLE, IC_LEFT, IC_RIGHT, IC_TRASH, IC_EDIT, IC_BOOKMARK, IC_GRID,
-    IC_EQ, IC_WAVE,
+    IC_EQ, IC_WAVE, IC_LOCK,
 };
 void drawIcon(int icon, float cx, float cy, float size, SDL_Color c);
 
@@ -251,7 +251,7 @@ void dialogDraw();
 
 // System keyboard (swkbd). Returns false when cancelled.
 bool keyboard(const std::string& header, const std::string& initial, std::string& out, int maxLen = 256,
-              bool numeric = false);
+              bool numeric = false, bool password = false);  // password: dots, not the text
 
 // ---------------------------------------------------------------- images
 // Decodes with SDL_image, applies JPEG EXIF orientation and downscales so it

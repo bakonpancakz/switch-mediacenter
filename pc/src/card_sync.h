@@ -47,6 +47,12 @@ constexpr uint64_t kSplitPart = 0xFFFF0000ull;
 // Writes src as a split file at dstDir.
 bool copySplitFile(const std::string& src, const std::string& dstDir, uint64_t partSize, const std::atomic<bool>& cancel,
                    const std::function<void(uint64_t)>& progress, unsigned long& error);
+// Copies src to dst passing every buffer through transform(data, size, offset in
+// the file) on the way (a locked folder's files get encrypted). partSize 0
+// writes one file, otherwise a split file as above.
+bool copyFileThrough(const std::string& src, const std::string& dst, uint64_t partSize,
+                     const std::function<void(uint8_t*, size_t, uint64_t)>& transform, const std::atomic<bool>& cancel,
+                     const std::function<void(uint64_t)>& progress, unsigned long& error);
 // Tests: split files bigger than `over` into parts of `part` bytes on any drive (0 = only on FAT32, as above).
 void splitForTests(uint64_t over, uint64_t part);
 

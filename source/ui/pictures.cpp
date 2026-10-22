@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 #include "core/library.h"
+#include "core/locks.h"
 #include "core/thread.h"
 
 namespace {
@@ -69,7 +70,9 @@ void worker() {
         }
         SDL_Surface* s = nullptr;
         std::string data;
-        if (Library::get().pictureData(id, data)) s = loadImageMem(data.data(), data.size(), 0, 0);
+        // (negative: a locked folder's, decrypted while it's open)
+        bool got = id < 0 ? locks::pictureData(id, data) : Library::get().pictureData(id, data);
+        if (got) s = loadImageMem(data.data(), data.size(), 0, 0);
         if (!s) appLog("picture %lld: couldn't read it", (long long)id);
         std::lock_guard<std::mutex> l(s_mx);
         s_busy.erase(id);
@@ -156,7 +159,7 @@ void picturesTick() {
 void picturesHoldOff() { s_holdUntil = g_ticks + 150; }
 
 SDL_Texture* pictureGet(int64_t id) {
-    if (id <= 0) return nullptr;
+    if (id == 0) return nullptr;  // (negative ids: a locked folder's)
     // Only arrived pictures have an entry. (Every request used to make one: past
     // 500 of them, from scrolling through a big folder, the cache trimming below
     // threw out every loaded picture each frame, the ones on screen included.)
@@ -191,7 +194,7 @@ SDL_Texture* pictureGet(int64_t id) {
 
 bool pictureFailed(int64_t id) {
     auto it = s_pics.find(id);
-    return id <= 0 || (it != s_pics.end() && it->second.failed);
+    return id == 0 || (it != s_pics.end() && it->second.failed);
 }
 
 SDL_Texture* bookCover(const std::string& path) {

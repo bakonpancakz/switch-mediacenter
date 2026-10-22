@@ -301,7 +301,7 @@ void dialogDraw() {
 // instead: a modal loop that reads input and draws the keyboard full-screen
 // until Done or Cancel. Touch, or the cursor when docked; B deletes (or
 // cancels when empty), + is Done.
-bool keyboard(const std::string& header, const std::string& initial, std::string& out, int maxLen, bool numeric) {
+bool keyboard(const std::string& header, const std::string& initial, std::string& out, int maxLen, bool numeric, bool password) {
     static const char* LETTERS[4] = {"1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm,."};
     static const char* SYMBOLS[4] = {"!@#$%^&*()", "~`=+[]{}\\|", "<>;:\"?_-+/", "'.,!?@#&*"};
     std::string text = initial;
@@ -341,6 +341,11 @@ bool keyboard(const std::string& header, const std::string& initial, std::string
         fillRound(field, 16, g_theme.panel2);
         strokeRound(field, 16, 2, g_theme.accent);
         std::string shown = text;
+        if (password) {  // a dot per character (counted by UTF-8 lead bytes)
+            shown.clear();
+            for (unsigned char ch : text)
+                if ((ch & 0xC0) != 0x80) shown += "\xE2\x80\xA2";
+        }
         while (!shown.empty() && textWidth(shown, 30) > field.w - 56) shown.erase(0, 1);
         int tw = drawText(shown, field.x + 24, field.y + (field.h - fontHeight(30)) / 2, 30, g_theme.fg);
         if ((g_ticks / 500) % 2) fillRect(field.x + 26 + tw, field.y + 18, 3, field.h - 36, g_theme.accent);

@@ -22,7 +22,11 @@ constexpr const char* INCOMING_DIR = ".incoming";
 inline const char* categoryDir(int c) { return c == C_MEDIA ? ".media/media" : c == C_BOOKS ? ".media/books" : ".media/files"; }
 inline const char* categoryLabel(int c) { return c == C_MEDIA ? "Media" : c == C_BOOKS ? "Books" : "Files"; }
 
-enum Kind { K_DIR = 0, K_IMAGE = 1, K_VIDEO = 2, K_AUDIO = 3, K_BOOK = 4 };
+// K_LOCKED: a locked folder (see lockbox.h). Its contents aren't in items:
+// they're in its row of locks, encrypted.
+enum Kind { K_DIR = 0, K_IMAGE = 1, K_VIDEO = 2, K_AUDIO = 3, K_BOOK = 4, K_LOCKED = 5 };
+// Locked folders' files go in <mapping folder>/.locked/<lock id>/, under names that say nothing.
+constexpr const char* LOCKED_DIR = ".locked";
 enum BookFormat { B_EPUB = 1, B_PDF = 2, B_COMIC = 3, B_TEXT = 4 };
 
 // Lowercase extension without the dot.
@@ -98,6 +102,20 @@ inline const char* SCHEMA_SQL =
     "CREATE TABLE books(id INTEGER PRIMARY KEY, root INTEGER NOT NULL, item INTEGER NOT NULL, title TEXT NOT NULL,"
     " author TEXT NOT NULL DEFAULT '', sort TEXT NOT NULL, cover INTEGER NOT NULL DEFAULT 0, format INTEGER NOT NULL,"
     " pages INTEGER NOT NULL DEFAULT 0, added INTEGER NOT NULL DEFAULT 0);\n";
+
+// Locked folders (lockbox.h), added to libraries made before them too:
+//   locks: per locked folder (item), its salt, iteration count and PIN check
+//   tag, whether the PIN is all digits (a number pad on the Switch), and its
+//   items, encrypted (lockbox::encodeItems) with nonce
+//   locked_pictures: its pictures, each encrypted with its own nonce; tag names
+//   the picture without saying what it is
+inline const char* LOCKS_SQL =
+    "CREATE TABLE IF NOT EXISTS locks(item INTEGER PRIMARY KEY, lock TEXT NOT NULL, salt BLOB NOT NULL,"
+    " iterations INTEGER NOT NULL, check_tag TEXT NOT NULL, numeric INTEGER NOT NULL DEFAULT 1, nonce INTEGER NOT NULL,"
+    " data BLOB NOT NULL);\n"
+    "CREATE TABLE IF NOT EXISTS locked_pictures(id INTEGER PRIMARY KEY, lock TEXT NOT NULL, tag TEXT NOT NULL,"
+    " nonce INTEGER NOT NULL, data BLOB NOT NULL, width INTEGER NOT NULL DEFAULT 0, height INTEGER NOT NULL DEFAULT 0);\n"
+    "CREATE INDEX IF NOT EXISTS locked_pictures_by_tag ON locked_pictures(lock, tag);\n";
 
 // "Episode 10" -> "episode 0000000010": a key that sorts naturally byte by byte.
 inline std::string sortKey(const std::string& s) {
